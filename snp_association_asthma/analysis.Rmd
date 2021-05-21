@@ -121,20 +121,6 @@ plot(ans)
 None of the SNPs meet our significance threshold.
 
 ```{r}
+ans.max <- maxstat(asthma.s, casecontrol)
 ans.max[,ans.max["Pr(>z)",] <= threshold]
 ```
-
-Try to find significance once more after controlling for a few variables.
-
-```{r}
-ans2 <- WGassociation(casecontrol ~ gender + smoke + bmi, data=asthma.s)
-```
-
-
-```{r}
-plot(ans)
-```
-
-Still nothing as none of the p-value cross the significance threshold with the Bonferroni adjustment.
-
-
