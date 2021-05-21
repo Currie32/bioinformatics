@@ -1,0 +1,140 @@
+---
+title: "SNP Association - Asthma"
+output:
+  html_document:
+    df_print: paged
+---
+
+This analysis aims to identify SNPs that are associated with individuals that have asthma.
+
+```{r}
+library(SNPassoc)
+```
+
+Load the data, originally from https://github.com/isglobal-brge/brgedata/blob/master/data/asthma.rda
+
+```{r}
+load("./data/asthma.rda")
+head(asthma)
+```
+Take a closer look at the features.
+
+```{r}
+str(asthma, list.len=9)
+```
+
+Identify which columns contain the SNP data.
+
+```{r}
+ asthma.s <- setupSNP(data=asthma, colSNPs=7:ncol(asthma), sep="")
+```
+
+Let's take a look at one of those columns.
+
+```{r}
+ head(asthma.s$rs1422993)
+```
+```{r}
+ class(asthma.s$rs1422993)
+```
+
+Summarise the content of this SNP.
+
+```{r}
+summary(asthma.s$rs1422993)
+```
+
+
+```{r}
+ head(summary(asthma.s))
+```
+
+See where the missing values and if there are any patterns here.
+
+```{r}
+ plotMissing(asthma.s, print.labels.SNPs = FALSE)
+```
+
+See which SNPs do not meet the Hardy-Weinberg equilibrium.
+
+```{r}
+hwe <- tableHWE(asthma.s, casecontrol)
+
+# Divide by 51 as that's the number of SNPs we are analysing.
+threshold <- 0.05 / 51
+snpNHWE <- hwe[,2] < threshold
+rownames(hwe)[snpNHWE]
+hwe[snpNHWE,]
+```
+
+All SNPs meet the HWE in the control group, so none of them need to be removed from the dataset before further analysis.
+
+For a bit of fun, let's find the SNP that is most outside the HWE.
+
+```{r}
+which.min(hwe[,3])
+```
+
+Perform an association analysis between rs184448 and the casecontrol.
+
+```{r}
+association(casecontrol ~ rs184448, data = asthma.s)
+```
+
+The dominant model is the most statistically significant, as individuals with this SNP seem to be 55% more likely to have asthma if they have this mutation.
+
+```{r}
+maxstat(asthma.s$casecontrol, asthma.s$rs184448)
+```
+
+When using the maximum statistic, the result has a low p-value, but it is still above our thresold (~0.0098).
+
+Control for a few variables to see how that affects the significance.
+
+```{r}
+association(casecontrol ~ rs184448 + gender + smoke + bmi, asthma.s)
+```
+
+The p-value has decreased and is now close to our threshold.
+
+To further inspect the data, we can take a look at the association when smoking is modeled as a factor.
+
+```{r}
+association(casecontrol ~ dominant(rs184448)*factor(smoke), data=asthma.s)
+```
+
+Non-smokers with this mutation have a higher association of asthma than non-smokers, although this result is not statistically significant. 
+
+Expand the analysis to perform a whole genome association analysis using all of the SNPs.
+
+```{r}
+ans <- WGassociation(casecontrol, data=asthma.s)
+head(ans)
+```
+
+Plot the results.
+
+```{r}
+plot(ans)
+```
+
+None of the SNPs meet our significance threshold.
+
+```{r}
+ans.max[,ans.max["Pr(>z)",] <= threshold]
+```
+
+Try to find significance once more after controlling for a few variables.
+
+```{r}
+ans2 <- WGassociation(casecontrol ~ gender + smoke + bmi, data=asthma.s)
+```
+
+
+```{r}
+plot(ans)
+```
+
+Still nothing as none of the p-value cross the significance threshold with the Bonferroni adjustment.
+
+
