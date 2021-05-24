@@ -3,9 +3,13 @@ title: "SNP Association - Asthma"
 output:
   html_document:
     df_print: paged
+  pdf_document: default
 ---
 
-This analysis aims to identify SNPs that are associated with individuals that have asthma.
+This analysis aims to identify SNPs that are associated with individuals that have asthma. Three methods will be used:
+- Genetic association using individual SNPs
+- Halotype association
+- Polygenic risk scores
 
 ```{r}
 library(SNPassoc)
@@ -17,6 +21,9 @@ Load the data, originally from https://github.com/isglobal-brge/brgedata/blob/ma
 load("./data/asthma.rda")
 head(asthma)
 ```
+
+## Genetic Association Studies
+
 Take a closer look at the features.
 
 ```{r}
@@ -124,3 +131,262 @@ None of the SNPs meet our significance threshold.
 ans.max <- maxstat(asthma.s, casecontrol)
 ans.max[,ans.max["Pr(>z)",] <= threshold]
 ```
+
+## Haplotype Analysis
+
+Perform a haplotype analysis to find sets of alleles that are associated with asthma.
+
+```{r}
+library(LDheatmap)
+library(genetics)
+library(biomaRt)
+library(haplo.stats)
+library(plyr)
+```
+
+Connect to the BioMart database to get the annotations for human SNPs.
+
+```{r}
+mart <- useMart("ENSEMBL_MART_SNP", dataset = "hsapiens_snp")
+nrow(listFilters(mart))
+head(listFilters(mart))
+```
+
+Idenitfy the row that contains the annotations.
+
+```{r}
+listFilters(mart)[11,]
+```
+
+Get the relevant attributes from the BioMart database.
+
+```{r}
+snps <- labels(asthma.s)
+snpInfo <- getBM(
+  c("refsnp_id", "chr_name", "chrom_start", "allele"),
+  filters=c("snp_filter"),
+  values=snps,
+  mart=mart)
+
+head(snpInfo)
+```
+
+Count the occurrences of each chromosome. 
+
+```{r}
+count(snpInfo, "chr_name")
+```
+
+Find the min and max loci of the SNPs on chromosome 7.
+
+```{r}
+min(snpInfo[snpInfo$chr_name == 7,]$chrom_start)
+max(snpInfo[snpInfo$chr_name == 7,]$chrom_start)
+```
+
+Filter the snpInfo to the relevant data and set up the haplotype data.
+
+```{r}
+mask <- with(snpInfo, chr_name=="7" & chrom_start>34.6e6 & chrom_start<34.9e6)
+snps.sel <- snpInfo[mask, "refsnp_id"]
+sel <- which(names(asthma)%in%snps.sel)
+asthma.hap <- setupSNP(asthma, sel, sep="")
+```
+
+Create a genotype object.
+
+```{r}
+snp.pos <- snpInfo[mask, "chrom_start"]
+snp.geno <- data.frame(lapply(asthma.hap[, snps.sel], genotype))
+```
+
+Create an LD heatmap.
+
+```{r}
+LDheatmap(
+  snp.geno,
+  LDmeasure = "r",
+  title = "Pairwise LD in r^2",
+  add.map = TRUE,
+  name = "myLDgrob",
+  add.key = TRUE,
+  SNP.name=snps.sel,
+)
+```
+
+Select a set of neighbouring SNPs and compute their haplotype frequency.
+
+```{r}
+snpsH <- c("rs10486657", "rs10250709", "rs10238983", "rs6958905")
+genoH <- make.geno(asthma.hap, snpsH)
+em <- haplo.em(genoH, locus.label = snpsH, miss.val = c(0, NA))
+em
+```
+
+Haplotype 6 is the most probable, accumulating nearly 50% of the haplotype sample.
+
+Measure the association between any of the haplotypes and an individual having asthma using a GLM.
+
+```{r}
+trait <- asthma.hap$casecontrol
+mod <- haplo.glm(
+  trait ~ genoH,
+  family="binomial",
+  locus.label=snpsH,
+  allele.lev=attributes(genoH)$unique.alleles,
+  control = haplo.glm.control(haplo.freq.min=0.05)
+)
+intervals(mod)
+```
+
+None of the haplotypes are significantly associated with asthma.
+
+Rather than selecting four SNPs like above, we can use a sliding window for better haplotype inference. We'll use a window size between 3 and 6.
+
+
+```{r}
+snpsH2 <- colnames(snp.geno)
+genoH2 <- make.geno(asthma.hap, snpsH2)
+trait <- asthma.hap$casecontrol
+haplo.score <- list()
+
+for (i in 3:6) {
+  haplo.score[[i-2]] <- haplo.score.slide(
+    trait,
+    genoH2,
+    trait.type="binomial",
+    n.slide=i,
+    simulate=TRUE,
+    sim.control=score.sim.control(min.sim=100, max.sim=200)
+  )
+}
+```
+
+Plot the results.
+
+```{r}
+par(mfrow=c(2,2))
+
+for (i in 3:6) {
+  plot(haplo.score[[i-2]])
+  title(paste("Sliding Window=", i, sep=""))
+}
+```
+
+The highest -log10 p-value is obtained for a haplotype of 3 SNP length starting at the 9th SNP of the selected SNPs. Let's create another GLM using this haplotype to see if we can find a statistically significant association with asthma.
+
+```{r}
+snpsH3 <- snpsH2[9:11]
+genoH3 <- make.geno(asthma.hap, snpsH3)
+mod <- haplo.glm(
+  trait~genoH3,
+  family="binomial",
+  locus.label=snpsH3,
+  allele.lev=attributes(genoH3)$unique.alleles,
+  control = haplo.glm.control(haplo.freq.min=0.05)
+)
+
+intervals(mod)
+```
+
+We see that individuals carrying the haplotype GCA have a 35% increased risk of asthma relative to those having the reference haplotype ACG.
+
+```{r}
+lrt <- mod$lrt
+pchisq(lrt$lrt, lrt$df, lower=FALSE)
+```
+
+The low chi-squared value suggests that this difference is significant.
+
+## Genetric Score
+
+Create a polygenic risk score to assess the collective prediction of the phenotype risk associated with multiple SNPs.
+
+```{r}
+library(PredictABEL)
+```
+
+Identify which columns in the dataset contains SNPs and measure their association with asthma using a whole genome association analysis. 
+
+```{r}
+dd.s <- setupSNP(asthma, 7:ncol(asthma), sep="")
+ans <- WGassociation(casecontrol, dd.s, model="log-additive")
+```
+
+Filter the SNPs so that only those that show an association at 0.1 level are included in the model.
+
+```{r}
+sel <- labels(dd.s)[additive(ans) < 0.1]
+dd.sel <- dd.s[,sel]
+head(dd.sel)
+```
+
+Reformat the SNP genotypes as 0, 1, and 2 using additive so that they can be used as a feature in the model. Join the case/control variables and the reformatted SNP genotypes.
+
+```{r}
+dd.sel <- data.frame(lapply(dd.sel, additive))
+dd.end <- data.frame(casecontrol=dd.s$casecontrol, dd.sel)
+head(dd.end)
+```
+
+First remove SNP genotypes with missing values, as they are not supported by the model. Then perform a stepwise model selection to determine which SNPs best predict asthma status.
+
+```{r}
+dd.end.complete <- dd.end[complete.cases(dd.end),]
+mod <- stepAIC(
+  glm(casecontrol ~ ., dd.end.complete, family="binomial"),
+  method="forward",
+  trace=0
+)
+
+snps.score <- names(coef(mod))[-1]
+snps.score
+```
+
+Collectively, these are the most predictive SNPs. They will be used to create the genetic score. But first, let's take a look at a summary that shows the SNPs’ associations of the selected SNPs with asthma.
+
+```{r}
+summary(mod)
+```
+
+Identify the columns of the SNPs that will be used to compute the genetic score.
+
+```{r}
+pos <- which(names(dd.end.complete)%in%snps.score)
+pos
+```
+
+Create the scores using riskScore.
+
+```{r}
+score <- riskScore(
+  mod,
+  data=dd.end.complete,
+  cGenPreds=pos,
+  Type="unweighted"
+)
+table(score)
+```
+
+Plot the distribution of the risk scores.
+
+```{r}
+hist(score, col="gray90")
+```
+
+Test the association between the genetic score and asthma status using a generalised linear model.
+
+```{r}
+mod.lin <- glm(casecontrol~score, dd.end.complete, family="binomial")
+exp(coef(mod.lin)[2])
+```
+
+According to this model, the risk of asthma increases 21% per risk allele that an individual has.
+
+Plot the model's performance.
+
+```{r}
+predrisk <- predRisk(mod.lin, dd.end.complete)
+plotROC(data=dd.end.complete, cOutcome=1, predrisk = predrisk)
+```
+
