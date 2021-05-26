@@ -1,0 +1,208 @@
+---
+title: Using microarray data to detect transcriptomic differences in the Alzheimer’s
+  disease study GSE63061
+output:
+  html_document:
+    df_print: paged
+---
+
+In this analysis we are going to normalise then model microarray data to detect transcriptomic differences in genes using data from the Alzheimer’s disease study GSE63061.
+
+```{r}
+library(Biobase)
+library(GEOquery)
+library(limma)
+library(sva)
+```
+
+## Normalise the data
+
+Load the expression data, originally from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE63061. Identify the probes and subject IDs.
+
+```{r}
+exprMat <- read.table(
+  "./GSE63061_non-normalized.txt",
+  header=TRUE,
+  check.names=FALSE,
+  as.is=TRUE
+)
+
+probesID <- exprMat[,1]
+exprMat <- exprMat[,-1]
+subsID <- colnames(exprMat)
+exprMat <- as.matrix(exprMat)
+```
+
+Normalizes expression intensities so that the intensities (or log-ratios) have similar distributions across the arrays.
+
+```{r}
+exprNormdat <- normalizeBetweenArrays(exprMat, method="quantile")
+
+exprNormdat[1:5,1:5]
+```
+
+To understand the effects of the normalisation, perform a log2 transformation on the normalised and non-normalised expression data, then concatenate and label the two datasets.
+
+```{r}
+L2exprMat <- log2(exprMat)
+L2exprNorm <- log2(exprNormdat)
+
+comp <- cbind(L2exprMat, L2exprNorm)
+nsubs <- ncol(L2exprMat)
+
+gr <- factor(rep(c("Not Normalized","Normalized"), each=nsubs))
+```
+
+Plot the distributions of each dataset.
+
+```{r}
+plotDensities(comp, group=gr, col=c("black","grey"), legend="topright")
+```
+
+We can see that the non-normalised data is variable, but the normalised data has the same distribution across subjects.
+
+Construct an ExpressionSet object with the normalized expression data.
+
+```{r}
+phenoDF <- data.frame(subsID, row.names=subsID)
+phenodat <- AnnotatedDataFrame(data=phenoDF)
+
+featureDF <- data.frame(probesID, row.names=probesID)
+featureData <- AnnotatedDataFrame(data=featureDF)
+
+exprNorm <- ExpressionSet(
+  assayData=L2exprNorm,
+  phenoData=phenodat,
+  featureData=featureData
+)
+
+show(exprNorm)
+```
+
+Download the processed data for GSE63061, to compare it with exprNorm.
+
+```{r}
+gsm.expr <- getGEO("GSE63061", destdir = ".")
+gsm.expr <- gsm.expr[[1]]
+show(gsm.expr)
+```
+
+Identify the probes IDs in each dataset.
+
+```{r}
+probesIDsGEO <- as.character(fData(gsm.expr)$ID)
+probesID <- as.character(fData(exprNorm)$probesID)
+```
+
+The normalized data, exprNorm, has not been filtered and contains more probes than gsm.expr. To compare the two dataset, filter to the common probes.
+
+```{r}
+selprobes <- probesID%in%probesIDsGEO
+nselprobes <- sum(selprobes)
+
+exprNorm.sel <- exprNorm[selprobes,]
+```
+
+Get the expression data from each dataset, then scale, concatenate, and label this data before plotting the intensity distributions.
+
+```{r}
+exprGEO <- exprs(gsm.expr)
+expr <- exprs(exprNorm.sel)
+
+exprScaledGEO <- scale(exprGEO, scale=FALSE)
+exprScaled <- scale(expr, scale=FALSE)
+
+comp <- cbind(exprScaledGEO, exprScaled)
+
+nsubs <- ncol(exprScaledGEO)
+gr <- factor(rep(c("Normalized GEO","Normalized"), each=nsubs))
+
+plotDensities(comp, group=gr, col=c("black", "grey"), legend="topright")
+```
+
+The distributions are very similar, so we can be confident that we have reproduced the normalization of this data as available in GEO.
+
+
+## Modelling differential expression
+
+Create variables for the phenotypes and statuses, then print the count of each status.
+
+```{r}
+pheno <- pData(phenoData(gsm.expr))
+status <- pheno$characteristics_ch1
+status <- gsub("status: ","", as.character(status))
+fstatus <- factor(status)
+levels(fstatus) <- gsub(" ", "", levels(fstatus))
+
+table(fstatus)
+```
+
+Create variables for the main two covariates: age and sex.
+
+```{r}
+age <- substr(pheno$characteristics_ch1.2, 6,7)
+age <- as.numeric(age)
+sex <- pheno$characteristics_ch1.3
+```
+
+Create two model matricies to measure the effect of the status variable. Then use the sva package to create two surrogate variables.
+
+```{r}
+phenodat <- data.frame(fstatus, age, sex)
+
+mod0 <- model.matrix( ~ age + sex, data=phenodat)
+mod <- model.matrix( ~ fstatus + age + sex, data=phenodat)
+
+svobj <- sva(exprGEO, mod, mod0, n.sv=2)
+```
+
+Create a new model matrix using the previous features plus the surrogate variables.
+
+```{r}
+sv1 <- svobj$sv[,1]
+sv2 <- svobj$sv[,2]
+design <- model.matrix(~ 0 + fstatus + sex + age + sv1 + sv2)
+colnames(design) <- c(levels(fstatus),"age","sex", "sva1","sva2")
+```
+
+Fit a linear model for each gene using the expression data.
+
+```{r}
+fit <- lmFit(exprGEO, design)
+```
+
+Create a contrast matrix using the design matrix from above. Next, compute estimated coefficients and standard errors for these contrasts. Finally, compute some statistics (t-statistics, moderated F-statistic, and log-odds) using eBayes.
+
+```{r}
+contrast.matrix <- makeContrasts(AD-CTL, MCI-CTL, AD-MCI, levels=design)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+```
+
+Identify which genes are significantly differentially expressed for each contrast and visualise these differences using a Venn diagram.
+
+```{r}
+results <- decideTests(fit2)
+vennDiagram(results, cex=c(1, 0.7, 0.5))
+```
+
+The most probes with significant results are specific of the AD vs CTL contrast.
+
+Print a dataframe showing the differentially expressed genes between AD and CTL with greatest statistical significance.
+
+```{r}
+tt <- topTable(fit2, coef=1, adjust="BH")
+
+genesIDs <- as.character(fData(gsm.expr)$ILMN_Gene)
+names(genesIDs) <- rownames(gsm.expr)
+
+data.frame(genesIDsgenes=genesIDs[rownames(tt)], logFC=tt$logFC, pvalAdj=tt$adj.P.Val)
+```
+
+The volcano plot below shows that the genes with significant expression differences are downregulated in AD with respect to controls at about -0.4 log2 fold change.
+
+```{r}
+volcanoplot(fit2, coef = 1, highlight=5, names=genesIDs, cex=0.2)
+```
+
