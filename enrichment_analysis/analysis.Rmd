@@ -1,0 +1,211 @@
+---
+title: "Over Representation Analysis"
+output: html_notebook
+---
+
+This analysis will seek to determine if there are genes from pre-defined sets (e.g. belonging to a specific GO term or KEGG pathway) are over-represented in our dataset (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE63061). This dataset consists of individuals with Alzheimer's disease, mild cognitive impairment, and controls.
+
+```{r}
+#library(clusterProfiler)
+library(GEOquery)
+#library(GSEABase)
+#library(GOstats)
+#library(KEGG.db)
+library(limma)
+library(org.Hs.eg.db)
+library(sva)
+```
+
+Load the transcriptomic data.
+
+```{r}
+gsm.expr <- getGEO("GSE63061")
+gsm.expr <- gsm.expr[[1]]
+exprGEO <- exprs(gsm.expr)
+```
+
+Get the phenotype data.
+
+```{r}
+pheno <- pData(phenoData(gsm.expr))
+status <- pheno$characteristics_ch1
+status <- gsub("status: ","", as.character(status))
+fstatus <- factor(status)
+levels(fstatus)<-gsub(" ", "", levels(fstatus))
+```
+
+Get the variables that will be used to build the models.
+
+```{r}
+age <- substr(pheno$characteristics_ch1.2, 6,7)
+age <- as.numeric(age)
+sex <- pheno$characteristics_ch1.3
+phenodat <- data.frame(fstatus, age, sex)
+```
+
+Build the models (with and without the individuals' status).
+
+```{r}
+#build models
+mod0 <- model.matrix( ~ age+sex, data = phenodat)
+mod <- model.matrix( ~ fstatus+age+sex, data = phenodat)
+```
+
+Compute surrogate variables for batch effects.
+
+```{r}
+svobj <- sva(exprGEO, mod, mod0, n.sv=2)
+design <- model.matrix(~ 0+fstatus+sex+age+svobj$sv[,1]+svobj$sv[,2])
+colnames(design) <- c(levels(fstatus),"age","sex", "sva1","sva2")
+```
+
+Fit the model for the desired contrast.
+
+```{r}
+fit <- lmFit(exprGEO, design)
+contrast.matrix <- makeContrasts(AD-CTL, MCI-CTL, AD-MCI, levels=design)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+```
+
+The object fit2 contains the results of the transcriptome-wise association analysis. For enrichment analysis, we first obtain the p-values of association for the contrast of Alzheimer’s disease against controls. These are the associations for each of the Illumina probes.
+
+```{r}
+results <- fit2$p.value
+head(results)
+```
+
+Filter to the relevant probes for this analysis, i.e. comparing individuals with Alzheimer's vs those in the control group.
+
+```{r}
+pvalues <- results[,"AD - CTL"]
+head(pvalues)
+```
+
+Adjust the p-values to reduce the false discovery rate and filter to only the significant probes. This leaves us with 819 probes.
+
+```{r}
+pAdj <- p.adjust(pvalues, "fdr")
+psig <- pAdj[pAdj < 0.01]
+
+length(psig)
+head(psig)
+```
+
+Map the Illumina probes to their genes.
+
+```{r}
+genesIDs <- as.character(fData(gsm.expr)$ILMN_Gene)
+names(genesIDs) <- rownames(gsm.expr)
+psigAnnot <- data.frame(genesIDs=genesIDs[names(psig)], pvalAdj=psig,stringsAsFactors=FALSE)
+
+head(psigAnnot)
+```
+
+Using the org.Hs.eg.db database, retrieve all the gene symbols and the entrez identifiers annotated in the human genome.
+
+```{r}
+genes <- keys(org.Hs.eg.db, keytype="SYMBOL")
+geneUniverse <- select(org.Hs.eg.db, keys=genes, columns=c("ENTREZID"), keytype="SYMBOL")
+length(geneUniverse)
+head(geneUniverse)
+```
+
+Get the entrez identifiers for the genes with DE transcripts.
+
+```{r}
+mappedgenes <- psigAnnot$genesIDs
+mappedgenes <- intersect(mappedgenes,geneUniverse$SYMBOL)
+selmappedgenes <- geneUniverse$SYMBOL%in%mappedgenes
+mappedgenesIds <- geneUniverse$ENTREZID[selmappedgenes]
+
+length(mappedgenesIds)
+head(mappedgenesIds)
+```
+
+Get the parameters that will be passed to Hhpergeometric tests for GO term association.
+
+```{r}
+params <- new(
+  "GOHyperGParams",
+  geneIds=mappedgenesIds,
+  universeGeneIds=geneUniverse$ENTREZID,
+  annotation="org.Hs.eg.db",
+  ontology="BP",
+  pvalueCutoff=0.05,
+  conditional=FALSE,
+  testDirection="over"
+)
+```
+
+Compute the p-values for over-representation of each GO term.
+
+```{r}
+hgOver <- hyperGTest(params)
+hgOver
+```
+
+See the GO terms with that are the most statistically significant.
+
+```{r}
+summary(hgOver)[c(1:5),]
+```
+
+Gene sets forming GO terms are not disjoint and overlapping GO terms will have correlating enrichment. Use a conditional test and generate another report.
+
+```{r}
+conditional(params) <- TRUE
+hgOverCond <- hyperGTest(params)
+summary(hgOver)[c(1:5),]
+```
+
+Create a full report to see all of the results.
+
+```{r}
+htmlReport(hgOverCond, file="goBPcond.html")
+```
+
+We can gain further insights using the using the KEGGdatabase. Get the mapping of human genes (with entrez identifiers) to the KEGG pathways identifiers.
+
+```{r}
+frame <- toTable(org.Hs.egPATH)
+keggframeData <- data.frame(frame$path_id, frame$gene_id)
+head(keggframeData)
+```
+
+Create a gene-set collection of 229 KEGG pathways with 5869 genes. 
+
+```{r}
+keggFrame <- KEGGFrame(keggframeData, organism="Homo sapiens")
+gsc.KEGG <- GeneSetCollection(keggFrame, setType = KEGGCollection())
+gsc.KEGG
+```
+
+Perform an enrichment analysis for each of these pathways, defining a new set of parameters that will be passed to the hypergeometric test function hyperGTest
+
+```{r}
+KEGG.params.bp <- GSEAKEGGHyperGParams(
+  name="KEGG",
+  geneSetCollection=gsc.KEGG,
+  geneIds=mappedgenesIds,
+  universeGeneIds=geneUniverse$ENTREZID, pvalueCutoff=0.05, testDirection="over"
+)
+KEGG.results.bp <- hyperGTest(KEGG.params.bp)
+summary(KEGG.results.bp)
+```
+
+We see that 15 KEGG pathways are significantly enriched in transcriptomic differences between Alzheimer’s cases and controls.
+
+With enrichKEGG from clusterProfiler, we can obtain similar results as before, with less amount of code but less control.
+
+```{r}
+res.enrich <- enrichKEGG(gene = mappedgenesIds, organism = 'hsa', pvalueCutoff = 0.05)
+res.enrich[, 1:7]
+```
+
+Create a dotplot to show the number of genes mapped in each of the pathways.
+
+```{r}
+dotplot(res.enrich)
+```
